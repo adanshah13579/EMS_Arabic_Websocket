@@ -110,8 +110,7 @@ module.exports = (server) => {
           sender,
           recipient,
           content,
-          timestamp: message.createdAt,
-        };
+          timestamp: message.createdAt,        };
 
         // Publish to Redis (centralized message distribution)
         redis.publish("chat", JSON.stringify(messageToPublish));
@@ -165,7 +164,7 @@ module.exports = (server) => {
                     as: "categoryDetails",
                   }
                 },
-                {$unwind: "$categoryDetails"}
+                {$unwind: {path: "$categoryDetails", preserveNullAndEmptyArrays: true}}
               ],
             },
           },
@@ -210,7 +209,8 @@ module.exports = (server) => {
           {
             $project: {
               _id: 1,
-              lastMessage: "$lastMessageDetails.content",
+              // lastMessage: "$lastMessageDetails.content",
+              lastMessage: 1,
               lastMessageTime: "$lastMessageDetails.timestamp",
               
               otherParticipant: {
