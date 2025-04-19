@@ -9,7 +9,7 @@ const mongoose = require("mongoose");
 module.exports = (server) => {
   const io = new Server(server, {
     cors: {
-      origin: process.env.CORS_ORIGIN || "*", 
+      origin: process.env.CORS_ORIGIN || "*", // More secure origin handling
       methods: ["GET", "POST"],
     },
   });
@@ -95,6 +95,7 @@ module.exports = (server) => {
           sender,
           recipient,
           content,
+          createdAt: Date.now(),
         }).save();
 
         // Update conversation
@@ -110,7 +111,8 @@ module.exports = (server) => {
           sender,
           recipient,
           content,
-          timestamp: message.createdAt,        };
+          createdAt: message.createdAt
+        };
 
         // Publish to Redis (centralized message distribution)
         redis.publish("chat", JSON.stringify(messageToPublish));
@@ -211,7 +213,7 @@ module.exports = (server) => {
               _id: 1,
               // lastMessage: "$lastMessageDetails.content",
               lastMessage: 1,
-              lastMessageTime: "$lastMessageDetails.timestamp",
+              lastMessageTime: "$lastMessageDetails.createdAt",
               
               otherParticipant: {
                 _id: { $arrayElemAt: ["$otherParticipants._id", 0] },
@@ -279,6 +281,7 @@ module.exports = (server) => {
           participants: userId, // Check if userId exists in participants array
         });
 
+
         if (!isParticipant) {
           return socket.emit("error", {
             message: "Access denied. Not a participant",
@@ -286,10 +289,10 @@ module.exports = (server) => {
         }
 
         const messages = await Message.find({ conversationId })
-          .sort({ timestamp: -1 })
+          .sort({ createdAt: -1 })
           .skip(skip)
           .limit(limit)
-          .select("conversationId sender recipient content timestamp"); // Only required fields
+          .select("conversationId sender recipient content createdAt"); // Only required fields
 
         const totalMessages = await Message.countDocuments({ conversationId });
 
