@@ -9,7 +9,7 @@ const mongoose = require("mongoose");
 module.exports = (server) => {
   const io = new Server(server, {
     cors: {
-      origin: process.env.CORS_ORIGIN || "*", // More secure origin handling
+      origin: process.env.CORS_ORIGIN || "*", 
       methods: ["GET", "POST"],
     },
   });
