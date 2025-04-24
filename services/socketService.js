@@ -2,6 +2,8 @@ const { Server } = require("socket.io");
 const redis = require("../config/redis");
 const Message = require("../models/Message");
 const Conversation = require("../models/Conversation");
+const Category = require("../models/Category");
+const User = require("../models/User");
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
 const mongoose = require("mongoose");
@@ -54,6 +56,17 @@ module.exports = (server) => {
       const recipientSocketId = userSockets.get(parsedMessage.recipient);
       const senderSockerId = userSockets.get(parsedMessage.sender);
 
+      // If message is a job offer, populate category details
+      if (parsedMessage.messageType === 'job_offer' && parsedMessage.categoryId) {
+        const category = await Category.findById(parsedMessage.categoryId).select('name');
+        if (category) {
+          parsedMessage.categoryDetails = {
+            _id: category._id,
+            name: category.name
+          };
+        }
+      }
+
       if (recipientSocketId) {
         io.to(recipientSocketId).emit("receive_Message", parsedMessage);
       }
@@ -65,15 +78,38 @@ module.exports = (server) => {
     }
   });
 
+  // Subscribe to chat updates
+  redis.subscribe("chat_update", async (message) => {
+    try {
+      const parsedMessage = JSON.parse(message);
+      const recipientSocketId = userSockets.get(parsedMessage.recipient);
+      const senderSocketId = userSockets.get(parsedMessage.sender);
+
+      if (recipientSocketId) {
+        io.to(recipientSocketId).emit("chat_update", parsedMessage);
+      }
+      if (senderSocketId) {
+        io.to(senderSocketId).emit("chat_update", parsedMessage);
+      }
+    } catch (error) {
+      console.error("Error processing Redis chat update:", error);
+    }
+  });
+
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
     // Send Message Handler
-    socket.on("send_Message", async ({ sender, recipient, content }) => {
+    socket.on("send_Message", async ({ sender, recipient, content, messageType, categoryId }) => {
       try {
         // Validate input
         if (!sender || !recipient || !content) {
           return socket.emit("error", "Missing required fields");
+        }
+
+        // Additional validation for job offer messages
+        if (messageType === 'job_offer' && !categoryId) {
+          return socket.emit("error", "Category ID is required for job offer messages");
         }
 
         // Find or create conversation
@@ -95,6 +131,9 @@ module.exports = (server) => {
           sender,
           recipient,
           content,
+          messageType: messageType || 'text',
+          categoryId: messageType === 'job_offer' ? categoryId : undefined,
+          jobOfferStatus: messageType === 'job_offer' ? 'pending' : undefined,
           createdAt: Date.now(),
         }).save();
 
@@ -106,11 +145,14 @@ module.exports = (server) => {
 
         // Prepare message for publishing
         const messageToPublish = {
-          _id: message._id, // Include message ID for client reference
+          _id: message._id,
           conversationId: conversation._id,
           sender,
           recipient,
           content,
+          messageType: message.messageType,
+          categoryId: message.categoryId,
+          jobOfferStatus: message.jobOfferStatus,
           createdAt: message.createdAt
         };
 
@@ -156,18 +198,7 @@ module.exports = (server) => {
               from: "users",
               localField: "participants",
               foreignField: "_id",
-              as: "participantDetails",
-              pipeline: [
-                {
-                  $lookup: {
-                    from: 'categories',
-                    localField: "category",
-                    foreignField: "_id",
-                    as: "categoryDetails",
-                  }
-                },
-                {$unwind: {path: "$categoryDetails", preserveNullAndEmptyArrays: true}}
-              ],
+              as: "participantDetails"
             },
           },
           {
@@ -217,7 +248,6 @@ module.exports = (server) => {
               
               otherParticipant: {
                 _id: { $arrayElemAt: ["$otherParticipants._id", 0] },
-                category: { $arrayElemAt: ["$otherParticipants.categoryDetails.name", 0] },
                 fullName: { $arrayElemAt: ["$otherParticipants.fullName", 0] },
                 profilePicUrl: {
                   $arrayElemAt: ["$otherParticipants.profilePicUrl", 0],
@@ -292,12 +322,27 @@ module.exports = (server) => {
           .sort({ createdAt: -1 })
           .skip(skip)
           .limit(limit)
-          .select("conversationId sender recipient content createdAt"); // Only required fields
+          .select("conversationId sender recipient content messageType categoryId jobOfferStatus createdAt");
+
+        // Populate category details for job offer messages
+        const messagesWithCategories = await Promise.all(messages.map(async (message) => {
+          const messageObj = message.toObject(); // Convert Mongoose document to plain object
+          if (messageObj.messageType === 'job_offer' && messageObj.categoryId) {
+            const category = await Category.findById(messageObj.categoryId).select('name');
+            if (category) {
+              messageObj.categoryDetails = {
+                _id: category._id,
+                name: category.name
+              };
+            }
+          }
+          return messageObj;
+        }));
 
         const totalMessages = await Message.countDocuments({ conversationId });
 
         socket.emit("Recent_Messages", {
-          messages,
+          messages: messagesWithCategories,
           conversation: isParticipant,
           page,
           totalPages: Math.ceil(totalMessages / limit),
@@ -308,6 +353,185 @@ module.exports = (server) => {
           message: "Failed to fetch recent messages",
           code: "FETCH_MESSAGES_ERROR",
           details: error.message,
+        });
+      }
+    });
+
+    // Accept Job Offer Handler
+    socket.on("accept_Job_Offer", async ({ messageId, userId }) => {
+      try {
+        if (!messageId || !userId) {
+          return socket.emit("error", "Message ID and User ID are required");
+        }
+
+        // Find the message
+        const message = await Message.findById(messageId);
+        if (!message) {
+          return socket.emit("error", "Message not found");
+        }
+
+        // Verify the user is the recipient
+        if (message.recipient.toString() !== userId) {
+          return socket.emit("error", "You are not authorized to accept this job offer");
+        }
+
+        // Verify it's a job offer message
+        if (message.messageType !== 'job_offer') {
+          return socket.emit("error", "This is not a job offer message");
+        }
+
+        // Check if job offer is already accepted
+        if (message.jobOfferStatus === 'accepted') {
+          return socket.emit("error", "This job offer has already been accepted");
+        }
+
+        // Update the message status
+        message.jobOfferStatus = 'accepted';
+        await message.save();
+
+        // Prepare update message
+        const updateMessage = {
+          _id: message._id,
+          conversationId: message.conversationId,
+          sender: message.sender,
+          recipient: message.recipient,
+          content: message.content,
+          messageType: message.messageType,
+          categoryId: message.categoryId,
+          jobOfferStatus: message.jobOfferStatus,
+          updatedAt: message.updatedAt
+        };
+
+        // Publish the update to Redis
+        redis.publish("chat_update", JSON.stringify(updateMessage));
+
+        // Create and send a new message about job acceptance
+        const acceptanceMessage = await new Message({
+          conversationId: message.conversationId,
+          sender: userId,
+          recipient: message.sender,
+          content: 'Auto Message: Job accepted',
+          messageType: 'text',
+          createdAt: Date.now(),
+        }).save();
+
+        // Prepare acceptance message for publishing
+        const messageToPublish = {
+          _id: acceptanceMessage._id,
+          conversationId: acceptanceMessage.conversationId,
+          sender: acceptanceMessage.sender,
+          recipient: acceptanceMessage.recipient,
+          content: acceptanceMessage.content,
+          messageType: acceptanceMessage.messageType,
+          createdAt: acceptanceMessage.createdAt
+        };
+
+        // Publish the acceptance message to Redis
+        redis.publish("chat", JSON.stringify(messageToPublish));
+
+      } catch (error) {
+        console.error("Error in accept_Job_Offer:", error);
+        socket.emit("error", "Failed to accept job offer");
+      }
+    });
+
+    // Get Service Provider Stats Handler
+    socket.on("get_service_provider_stats", async (userId) => {
+      try {
+        if (!userId) {
+          return socket.emit("error", {
+            message: "User ID is required",
+            code: "INVALID_INPUT"
+          });
+        }
+
+        const connectedUserId = getUserIdBySocketId(socket.id);
+        if (!connectedUserId || connectedUserId !== userId) {
+          return socket.emit("error", {
+            message: "Unauthorized access",
+            code: "UNAUTHORIZED"
+          });
+        }
+
+        // Get completed jobs (accepted job offers)
+        const completedJobs = await Message.countDocuments({
+          recipient: userId,
+          messageType: 'job_offer',
+          jobOfferStatus: 'accepted'
+        });
+
+        // Get pending jobs (pending job offers)
+        const pendingJobs = await Message.countDocuments({
+          recipient: userId,
+          messageType: 'job_offer',
+          jobOfferStatus: 'pending'
+        });
+
+        // Get recent completed jobs with details
+        const recentCompletedJobs = await Message.find({
+          recipient: userId,
+          messageType: 'job_offer',
+          jobOfferStatus: 'accepted'
+        })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .populate({
+          path: 'sender',
+          select: 'fullName location phoneNumber'
+        })
+        .populate({
+          path: 'categoryId',
+          select: 'name'
+        })
+        .select('content createdAt');
+
+        // Get recent pending jobs with details
+        const recentPendingJobs = await Message.find({
+          recipient: userId,
+          messageType: 'job_offer',
+          jobOfferStatus: 'pending'
+        })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .populate({
+          path: 'sender',
+          select: 'fullName location phoneNumber'
+        })
+        .populate({
+          path: 'categoryId',
+          select: 'name'
+        })
+        .select('content createdAt');
+
+        socket.emit("service_provider_stats", {
+          completedJobs,
+          pendingJobs,
+          totalJobs: completedJobs + pendingJobs,
+          recentCompletedJobs: recentCompletedJobs.map(job => ({
+            categoryName: job.categoryId?.name || 'Unknown Category',
+            senderName: job.sender?.fullName || 'Unknown Sender',
+            address: job.sender?.location || 'No Address Provided',
+            phoneNumber: job.sender?.phoneNumber || 'No Phone Provided',
+            content: job.content,
+            date: job.createdAt,
+            status: 'completed'
+          })),
+          recentPendingJobs: recentPendingJobs.map(job => ({
+            categoryName: job.categoryId?.name || 'Unknown Category',
+            senderName: job.sender?.fullName || 'Unknown Sender',
+            address: job.sender?.location || 'No Address Provided',
+            phoneNumber: job.sender?.phoneNumber || 'No Phone Provided',
+            content: job.content,
+            date: job.createdAt,
+            status: 'pending'
+          }))
+        });
+      } catch (error) {
+        console.error("Error in get_service_provider_stats:", error);
+        socket.emit("error", {
+          message: "Failed to fetch service provider stats",
+          code: "FETCH_STATS_ERROR",
+          details: error.message
         });
       }
     });
