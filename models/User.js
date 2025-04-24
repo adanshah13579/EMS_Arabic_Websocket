@@ -7,7 +7,7 @@ const UserSchema = new mongoose.Schema(
       trim: true,
       // Make fullName optional for admin
       required: function () {
-        return this.userType !== "admin";
+        return !this.isAdmin;
       },
     },
     email: {
@@ -25,21 +25,20 @@ const UserSchema = new mongoose.Schema(
       type: String,
       trim: true,
       default: function () {
-        return this.userType === "serviceProvider"
-          ? "Hi there, I am EMS user, let's connect!!"
+        return this.isProvider
+          ? "Hi there, I am EMS Service Provider, let's connect!!"
           : "";
       },
     },
-
     phoneNumber: {
       type: String,
       trim: true,
       // Make phone number optional for admin
       required: function () {
-        return this.userType !== "admin";
+        return !this.isAdmin;
       },
       unique: function () {
-        return this.userType !== "admin";
+        return !this.isAdmin;
       },
     },
     password: {
@@ -47,16 +46,23 @@ const UserSchema = new mongoose.Schema(
       required: [true, "Password is required"],
       minlength: [6, "Password must be at least 6 characters long"],
     },
-    userType: {
-      type: String,
-      enum: ["user", "serviceProvider", "admin"],
-      default: "user",
+    isClient: {
+      type: Boolean,
+      default: false,
+    },
+    isAdmin: {
+      type: Boolean,
+      default: false,
+    },
+    isProvider: {
+      type: Boolean,
+      default: false,
     },
     category: {
-      type: mongoose.Schema.Types.ObjectId,
+      type: [mongoose.Schema.Types.ObjectId],
       ref: "Category",
       required: function () {
-        return this.userType === "serviceProvider";
+        return this.isProvider;
       },
     },
     rank: {
@@ -80,14 +86,13 @@ const UserSchema = new mongoose.Schema(
         default: "N/A",
       },
     },
-    accoutStatus: {
+    accountStatus: {
       type: String,
-      enum: ["active", "suspended", "deleted"],
+      enum: ["active", "suspended", "deleted","pending"],
       default: "active",
     },
     profilePicUrl: {
       type: String,
-
       default:
         "https://icons.veryicon.com/png/o/miscellaneous/standard/avatar-15.png",
     },
@@ -95,7 +100,26 @@ const UserSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+    images: {
+      type: [String],
+      default: [],
+    },
+    isOnline: {
+      type: Boolean,
+      default: false,
+    },
+    hourlyRate: {
+      type: Number,
+      min: [0, "Hourly rate cannot be negative"],
+      default: 0,
+    },
+    googleId: {
+      type: String,
+      unique: true,
+      sparse: true, // This allows multiple null values
+    },
   },
+
   {
     timestamps: true,
   }
