@@ -100,7 +100,7 @@ module.exports = (server) => {
     console.log("User connected:", socket.id);
 
     // Send Message Handler
-    socket.on("send_Message", async ({ sender, recipient, content, messageType, categoryId }) => {
+    socket.on("send_Message", async ({ sender, recipient, content, messageType, categoryId, newConversation }) => {
       try {
         // Validate input
         if (!sender || !recipient || !content) {
@@ -112,17 +112,42 @@ module.exports = (server) => {
           return socket.emit("error", "Category ID is required for job offer messages");
         }
 
-        // Find or create conversation
+        // Find existing conversation
         let conversation = await Conversation.findOne({
           participants: { $all: [sender, recipient] },
         });
 
-        if (!conversation) {
+        // Handle new conversation case
+        if (newConversation) {
+          if (conversation) {
+            const messageToPublish = {
+              conversationId: conversation._id,
+              sender,
+              recipient,
+              content,
+              messageType: 'text',
+            };
+            return redis.publish("chat", JSON.stringify(messageToPublish));
+            // If conversation exists, don't send message
+            // return socket.emit("error", "Conversation already exists");
+          }
+          // If conversation doesn't exist, create it
           conversation = await new Conversation({
             participants: [sender, recipient],
             lastMessage: content,
             lastMessageTime: Date.now(),
           }).save();
+        } 
+        // Handle existing conversation case
+        else {
+          if (!conversation) {
+            // If conversation doesn't exist, create it
+            conversation = await new Conversation({
+              participants: [sender, recipient],
+              lastMessage: content,
+              lastMessageTime: Date.now(),
+            }).save();
+          }
         }
 
         // Create and save message
