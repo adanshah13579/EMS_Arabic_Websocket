@@ -20,11 +20,16 @@ const MessageSchema = new mongoose.Schema(
     },
     jobOfferStatus: {
       type: String,
-      enum: ['pending', 'accepted'],
+      enum: ['pending', 'accepted', 'completed'],
       default: 'pending',
       required: function() {
         return this.messageType === 'job_offer';
       }
+    },
+    reviewId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Review",
+      default: null
     }
   },
   {

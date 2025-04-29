@@ -7,6 +7,7 @@ const User = require("../models/User");
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
 const mongoose = require("mongoose");
+const Review = require("../models/Review");
 
 module.exports = (server) => {
   const io = new Server(server, {
@@ -49,58 +50,76 @@ module.exports = (server) => {
     }
   });
 
-  // Global Redis message subscription
-  redis.subscribe("chat", async (message) => {
-    try {
-      const parsedMessage = JSON.parse(message);
-      const recipientSocketId = userSockets.get(parsedMessage.recipient);
-      const senderSockerId = userSockets.get(parsedMessage.sender);
+    // Global Redis message subscription
+    redis.subscribe("chat", async (message) => {
+      try {
+        const parsedMessage = JSON.parse(message);
+        const recipientSocketId = userSockets.get(parsedMessage.recipient);
+        const senderSockerId = userSockets.get(parsedMessage.sender);
 
-      // If message is a job offer, populate category details
-      if (parsedMessage.messageType === 'job_offer' && parsedMessage.categoryId) {
-        const category = await Category.findById(parsedMessage.categoryId).select('name');
-        if (category) {
-          parsedMessage.categoryDetails = {
-            _id: category._id,
-            name: category.name
-          };
+        // If message is a job offer, populate category details
+        if (parsedMessage.messageType === 'job_offer' && parsedMessage.categoryId) {
+          const category = await Category.findById(parsedMessage.categoryId).select('name');
+          if (category) {
+            parsedMessage.categoryDetails = {
+              _id: category._id,
+              name: category.name
+            };
+          }
         }
-      }
 
-      if (recipientSocketId) {
-        io.to(recipientSocketId).emit("receive_Message", parsedMessage);
+        if (recipientSocketId) {
+          io.to(recipientSocketId).emit("receive_Message", parsedMessage);
+        }
+        if (senderSockerId) {
+          io.to(senderSockerId).emit("receive_Message", parsedMessage);
+        }
+      } catch (error) {
+        console.error("Error processing Redis message:", error);
       }
-      if (senderSockerId) {
-        io.to(senderSockerId).emit("receive_Message", parsedMessage);
-      }
-    } catch (error) {
-      console.error("Error processing Redis message:", error);
-    }
-  });
+    });
 
-  // Subscribe to chat updates
-  redis.subscribe("chat_update", async (message) => {
-    try {
-      const parsedMessage = JSON.parse(message);
-      const recipientSocketId = userSockets.get(parsedMessage.recipient);
-      const senderSocketId = userSockets.get(parsedMessage.sender);
+    // Subscribe to chat updates
+    redis.subscribe("chat_update", async (message) => {
+      try {
+        const parsedMessage = JSON.parse(message);
+        const recipientSocketId = userSockets.get(parsedMessage.recipient);
+        const senderSocketId = userSockets.get(parsedMessage.sender);
 
-      if (recipientSocketId) {
-        io.to(recipientSocketId).emit("chat_update", parsedMessage);
+        if (recipientSocketId) {
+          io.to(recipientSocketId).emit("chat_update", parsedMessage);
+        }
+        if (senderSocketId) {
+          io.to(senderSocketId).emit("chat_update", parsedMessage);
+        }
+      } catch (error) {
+        console.error("Error processing Redis chat update:", error);
       }
-      if (senderSocketId) {
-        io.to(senderSocketId).emit("chat_update", parsedMessage);
+    });
+
+    // Subscribe to job status updates
+    redis.subscribe("job_status_update", async (message) => {
+      try {
+        const parsedMessage = JSON.parse(message);
+        const recipientSocketId = userSockets.get(parsedMessage.recipient);
+        const senderSocketId = userSockets.get(parsedMessage.sender);
+
+        if (recipientSocketId) {
+          io.to(recipientSocketId).emit("job_status_update", parsedMessage);
+        }
+        if (senderSocketId) {
+          io.to(senderSocketId).emit("job_status_update", parsedMessage);
+        }
+      } catch (error) {
+        console.error("Error processing Redis job status update:", error);
       }
-    } catch (error) {
-      console.error("Error processing Redis chat update:", error);
-    }
-  });
+    });
 
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
     // Send Message Handler
-    socket.on("send_Message", async ({ sender, recipient, content, messageType, categoryId }) => {
+    socket.on("send_Message", async ({ sender, recipient, content, messageType, categoryId, newConversation }) => {
       try {
         // Validate input
         if (!sender || !recipient || !content) {
@@ -112,17 +131,42 @@ module.exports = (server) => {
           return socket.emit("error", "Category ID is required for job offer messages");
         }
 
-        // Find or create conversation
+        // Find existing conversation
         let conversation = await Conversation.findOne({
           participants: { $all: [sender, recipient] },
         });
 
-        if (!conversation) {
+        // Handle new conversation case
+        if (newConversation) {
+          if (conversation) {
+            const messageToPublish = {
+              conversationId: conversation._id,
+              sender,
+              recipient,
+              content,
+              messageType: 'text',
+            };
+            return redis.publish("chat", JSON.stringify(messageToPublish));
+            // If conversation exists, don't send message
+            // return socket.emit("error", "Conversation already exists");
+          }
+          // If conversation doesn't exist, create it
           conversation = await new Conversation({
             participants: [sender, recipient],
             lastMessage: content,
             lastMessageTime: Date.now(),
           }).save();
+        } 
+        // Handle existing conversation case
+        else {
+          if (!conversation) {
+            // If conversation doesn't exist, create it
+            conversation = await new Conversation({
+              participants: [sender, recipient],
+              lastMessage: content,
+              lastMessageTime: Date.now(),
+            }).save();
+          }
         }
 
         // Create and save message
@@ -322,11 +366,13 @@ module.exports = (server) => {
           .sort({ createdAt: -1 })
           .skip(skip)
           .limit(limit)
-          .select("conversationId sender recipient content messageType categoryId jobOfferStatus createdAt");
+          .select("conversationId sender recipient content messageType categoryId jobOfferStatus reviewId createdAt");
 
-        // Populate category details for job offer messages
-        const messagesWithCategories = await Promise.all(messages.map(async (message) => {
+        // Populate category details for job offer messages and review details for completed jobs
+        const messagesWithDetails = await Promise.all(messages.map(async (message) => {
           const messageObj = message.toObject(); // Convert Mongoose document to plain object
+          
+          // Populate category details for job offer messages
           if (messageObj.messageType === 'job_offer' && messageObj.categoryId) {
             const category = await Category.findById(messageObj.categoryId).select('name');
             if (category) {
@@ -336,13 +382,27 @@ module.exports = (server) => {
               };
             }
           }
+          
+          // Populate review details for completed job offers
+          if (messageObj.messageType === 'job_offer' && 
+              messageObj.jobOfferStatus === 'completed' && 
+              messageObj.reviewId) {
+            const review = await Review.findById(messageObj.reviewId).select('stars comment');
+            if (review) {
+              messageObj.reviewDetails = {
+                stars: review.stars,
+                comment: review.comment
+              };
+            }
+          }
+          
           return messageObj;
         }));
 
         const totalMessages = await Message.countDocuments({ conversationId });
 
         socket.emit("Recent_Messages", {
-          messages: messagesWithCategories,
+          messages: messagesWithDetails,
           conversation: isParticipant,
           page,
           totalPages: Math.ceil(totalMessages / limit),
@@ -435,6 +495,164 @@ module.exports = (server) => {
       }
     });
 
+    // Mark Job as Completed Handler
+    socket.on("mark_job_completed", async ({ messageId, userId }) => {
+      try {
+        if (!messageId || !userId) {
+          return socket.emit("error", "Message ID and User ID are required");
+        }
+
+        // Find the message
+        const message = await Message.findById(messageId);
+        if (!message) {
+          return socket.emit("error", "Message not found");
+        }
+
+        // Verify the user is the recipient
+        if (message.recipient.toString() !== userId) {
+          return socket.emit("error", "You are not authorized to mark this job as completed");
+        }
+
+        // Verify it's a job offer message
+        if (message.messageType !== 'job_offer') {
+          return socket.emit("error", "This is not a job offer message");
+        }
+
+        // Check if job offer is accepted
+        if (message.jobOfferStatus !== 'accepted') {
+          return socket.emit("error", "Only accepted jobs can be marked as completed");
+        }
+
+        // Update the message status
+        message.jobOfferStatus = 'completed';
+        await message.save();
+
+        // Prepare update message
+        const updateMessage = {
+          _id: message._id,
+          conversationId: message.conversationId,
+          sender: message.sender,
+          recipient: message.recipient,
+          content: message.content,
+          messageType: message.messageType,
+          categoryId: message.categoryId,
+          jobOfferStatus: message.jobOfferStatus,
+          updatedAt: message.updatedAt
+        };
+
+        // Publish the update to Redis
+        redis.publish("chat_update", JSON.stringify(updateMessage));
+
+        // Prepare job status update message
+        const jobStatusUpdate = {
+          sender: message.sender,
+          recipient: message.recipient,
+        };
+
+        // Publish job status update to Redis
+        redis.publish("job_status_update", JSON.stringify(jobStatusUpdate));
+
+        // Create and send a new message about job completion
+        const completionMessage = await new Message({
+          conversationId: message.conversationId,
+          sender: userId,
+          recipient: message.sender,
+          content: 'Auto Message: Job is completed/delivered',
+          messageType: 'text',
+          createdAt: Date.now(),
+        }).save();
+
+        // Prepare completion message for publishing
+        const messageToPublish = {
+          _id: completionMessage._id,
+          conversationId: completionMessage.conversationId,
+          sender: completionMessage.sender,
+          recipient: completionMessage.recipient,
+          content: completionMessage.content,
+          messageType: completionMessage.messageType,
+          createdAt: completionMessage.createdAt
+        };
+
+        // Publish the completion message to Redis
+        redis.publish("chat", JSON.stringify(messageToPublish));
+
+      } catch (error) {
+        console.error("Error in mark_job_completed:", error);
+        socket.emit("error", "Failed to mark job as completed");
+      }
+    });
+
+    // Leave Review Handler
+    socket.on("leave_review", async ({ messageId, userId, stars, comment }) => {
+      try {
+        if (!messageId || !userId || !stars || !comment) {
+          return socket.emit("error", "Message ID, User ID, stars, and comment are required");
+        }
+
+        // Find the message
+        const message = await Message.findById(messageId);
+        if (!message) {
+          return socket.emit("error", "Message not found");
+        }
+
+        // Verify the user is the sender
+        if (message.sender.toString() !== userId) {
+          return socket.emit("error", "Only the job sender can leave a review");
+        }
+
+        // Verify it's a job offer message and is completed
+        if (message.messageType !== 'job_offer' || message.jobOfferStatus !== 'completed') {
+          return socket.emit("error", "Reviews can only be left on completed jobs");
+        }
+
+        // Check if review already exists
+        if (message.reviewId) {
+          return socket.emit("error", "A review has already been left for this job");
+        }
+
+        // Validate stars
+        if (stars < 1 || stars > 5) {
+          return socket.emit("error", "Stars must be between 1 and 5");
+        }
+
+        // Create the review
+        const review = await new Review({
+          messageId: message._id,
+          stars,
+          comment,
+          receiver: message.recipient
+        }).save();
+
+        // Update the message with the review ID
+        message.reviewId = review._id;
+        await message.save();
+
+        // Prepare update message with review details
+        const updateMessage = {
+          _id: message._id,
+          conversationId: message.conversationId,
+          sender: message.sender,
+          recipient: message.recipient,
+          content: message.content,
+          messageType: message.messageType,
+          reviewId: message.reviewId,
+          jobOfferStatus: message.jobOfferStatus,
+          reviewDetails: {
+            stars: review.stars,
+            comment: review.comment
+          },
+          updatedAt: message.updatedAt
+        };
+
+        // Publish the update to Redis
+        redis.publish("chat_update", JSON.stringify(updateMessage));
+
+      } catch (error) {
+        console.error("Error in leave_review:", error);
+        socket.emit("error", "Failed to leave review");
+      }
+    });
+
     // Get Service Provider Stats Handler
     socket.on("get_service_provider_stats", async (userId) => {
       try {
@@ -457,7 +675,7 @@ module.exports = (server) => {
         const completedJobs = await Message.countDocuments({
           recipient: userId,
           messageType: 'job_offer',
-          jobOfferStatus: 'accepted'
+          jobOfferStatus: 'completed'
         });
 
         // Get pending jobs (pending job offers)
@@ -467,11 +685,18 @@ module.exports = (server) => {
           jobOfferStatus: 'pending'
         });
 
+        // Get accepted jobs (accepted job offers)
+        const acceptedJobs = await Message.countDocuments({
+          recipient: userId,
+          messageType: 'job_offer',
+          jobOfferStatus: 'accepted'
+        });
+
         // Get recent completed jobs with details
         const recentCompletedJobs = await Message.find({
           recipient: userId,
           messageType: 'job_offer',
-          jobOfferStatus: 'accepted'
+          jobOfferStatus: 'completed'
         })
         .sort({ createdAt: -1 })
         .limit(5)
@@ -483,7 +708,11 @@ module.exports = (server) => {
           path: 'categoryId',
           select: 'name'
         })
-        .select('content createdAt');
+        .populate({
+          path: 'reviewId',
+          select: 'stars comment'
+        })
+        .select('content createdAt reviewId');
 
         // Get recent pending jobs with details
         const recentPendingJobs = await Message.find({
@@ -503,10 +732,29 @@ module.exports = (server) => {
         })
         .select('content createdAt');
 
+        // Get recent accepted jobs with details
+        const recentAcceptedJobs = await Message.find({
+          recipient: userId,
+          messageType: 'job_offer',
+          jobOfferStatus: 'accepted'
+        })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .populate({
+          path: 'sender',
+          select: 'fullName location phoneNumber'
+        })
+        .populate({
+          path: 'categoryId',
+          select: 'name'
+        })
+        .select('content createdAt');
+
         socket.emit("service_provider_stats", {
           completedJobs,
           pendingJobs,
-          totalJobs: completedJobs + pendingJobs,
+          acceptedJobs,
+          totalJobs: completedJobs + pendingJobs + acceptedJobs,
           recentCompletedJobs: recentCompletedJobs.map(job => ({
             categoryName: job.categoryId?.name || 'Unknown Category',
             senderName: job.sender?.fullName || 'Unknown Sender',
@@ -514,7 +762,11 @@ module.exports = (server) => {
             phoneNumber: job.sender?.phoneNumber || 'No Phone Provided',
             content: job.content,
             date: job.createdAt,
-            status: 'completed'
+            status: 'completed',
+            reviewDetails: job.reviewId ? {
+              stars: job.reviewId.stars,
+              comment: job.reviewId.comment
+            } : null
           })),
           recentPendingJobs: recentPendingJobs.map(job => ({
             categoryName: job.categoryId?.name || 'Unknown Category',
@@ -524,6 +776,16 @@ module.exports = (server) => {
             content: job.content,
             date: job.createdAt,
             status: 'pending'
+          })),
+          recentAcceptedJobs: recentAcceptedJobs.map(job => ({
+            _id: job._id,
+            categoryName: job.categoryId?.name || 'Unknown Category',
+            senderName: job.sender?.fullName || 'Unknown Sender',
+            address: job.sender?.location || 'No Address Provided',
+            phoneNumber: job.sender?.phoneNumber || 'No Phone Provided',
+            content: job.content,
+            date: job.createdAt,
+            status: 'accepted'
           }))
         });
       } catch (error) {
